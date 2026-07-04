@@ -36,6 +36,7 @@ Options:
 | `--include-trashed` | Also export notes that are in the trash. |
 | `--include-archived` | Also export archived notes. |
 | `--flat` | Put all notes directly into the output directory instead of one directory per tag. |
+| `--overwrite` | Overwrite existing files instead of writing a copy with a numerical suffix (` (2)`, ` (3)`, …). |
 
 Encrypted notes are skipped (Bear does not store their text in readable
 form); a warning is printed for each attachment that is referenced but
