@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -6,7 +6,7 @@ use std::sync::LazyLock;
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, SecondsFormat, TimeDelta, TimeZone, Utc};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
 use regex::{Captures, Regex};
 use rusqlite::Connection;
@@ -58,10 +58,34 @@ struct Cli {
     #[arg(long)]
     flat: bool,
 
-    /// Overwrite existing files instead of writing a copy with a numerical
-    /// suffix (` (2)`, ` (3)`, …).
-    #[arg(long)]
-    overwrite: bool,
+    /// How to treat a note or attachment whose file name already exists in the
+    /// output directory.
+    #[arg(long, value_enum, default_value = "copy")]
+    mode: Mode,
+}
+
+/// What to do when an export would land on a file name that is already taken in
+/// the output directory. The names follow the idioms of rsync-like tools.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Mode {
+    /// Never overwrite: write the note or attachment to a copy with a numerical
+    /// suffix (` (2)`, ` (3)`, …) instead. This is the default and never
+    /// touches files already in the output directory.
+    Copy,
+    /// Overwrite existing files in place, but leave any other files in the
+    /// output directory alone.
+    Update,
+    /// Overwrite existing files in place and delete notes and attachments in
+    /// the output directory that no longer correspond to anything in Bear, so
+    /// the output becomes an exact mirror of the export.
+    Mirror,
+}
+
+impl Mode {
+    /// Whether an existing file should be overwritten rather than copied aside.
+    fn overwrites(self) -> bool {
+        matches!(self, Mode::Update | Mode::Mirror)
+    }
 }
 
 struct Note {
@@ -102,21 +126,76 @@ fn main() -> Result<()> {
             app_data.join("Local Files").join("Note Files"),
         ],
         flat: cli.flat,
-        overwrite: cli.overwrite,
+        mode: cli.mode,
     };
     let mut attachments = 0;
+    let mut kept = HashSet::new();
     for note in &notes {
-        attachments += exporter
+        let written = exporter
             .export(note)
             .with_context(|| format!("failed to export note “{}”", note.title))?;
+        attachments += written.attachments;
+        if cli.mode == Mode::Mirror {
+            for path in written.files {
+                kept.insert(path.canonicalize().unwrap_or(path));
+            }
+        }
     }
 
-    println!(
-        "Exported {} note(s) and {attachments} attachment(s) to {}.",
+    let deleted = if cli.mode == Mode::Mirror {
+        prune(&cli.output, &kept).context("failed to prune stale files from the output")?
+    } else {
+        0
+    };
+
+    print!(
+        "Exported {} note(s) and {attachments} attachment(s) to {}",
         notes.len(),
         cli.output.display()
     );
+    if deleted > 0 {
+        print!("; deleted {deleted} stale file(s)");
+    }
+    println!(".");
     Ok(())
+}
+
+/// Deletes any file under `output` that is not in `kept`, then removes the
+/// directories left empty by those deletions. Returns the number of files
+/// deleted. Used by `Mode::Mirror` to make the output an exact replica of the
+/// export.
+fn prune(output: &Path, kept: &HashSet<PathBuf>) -> Result<usize> {
+    if !output.is_dir() {
+        return Ok(0);
+    }
+    let mut deleted = 0;
+    prune_dir(output, kept, &mut deleted)?;
+    Ok(deleted)
+}
+
+/// Recursively prunes `dir`, returning whether it is empty afterwards so the
+/// caller can remove directories that no longer hold any kept files.
+fn prune_dir(dir: &Path, kept: &HashSet<PathBuf>, deleted: &mut usize) -> Result<bool> {
+    let mut empty = true;
+    for entry in fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            if prune_dir(&path, kept, deleted)? {
+                fs::remove_dir(&path)
+                    .with_context(|| format!("failed to remove {}", path.display()))?;
+            } else {
+                empty = false;
+            }
+        } else if kept.contains(&path.canonicalize().unwrap_or_else(|_| path.clone())) {
+            empty = false;
+        } else {
+            fs::remove_file(&path)
+                .with_context(|| format!("failed to remove {}", path.display()))?;
+            *deleted += 1;
+        }
+    }
+    Ok(empty)
 }
 
 /// The standard location of Bear's database on macOS.
@@ -242,20 +321,28 @@ struct Exporter {
     output: PathBuf,
     attachment_dirs: Vec<PathBuf>,
     flat: bool,
-    overwrite: bool,
+    mode: Mode,
+}
+
+/// The result of exporting a single note.
+struct Export {
+    /// Number of attachments copied for the note.
+    attachments: usize,
+    /// Files written for the note (the Markdown file and its attachments), used
+    /// by `Mode::Mirror` to know what to keep.
+    files: Vec<PathBuf>,
 }
 
 impl Exporter {
-    /// Writes the note (and the attachments it references) to disk and returns
-    /// the number of attachments copied.
-    fn export(&self, note: &Note) -> Result<usize> {
+    /// Writes the note (and the attachments it references) to disk.
+    fn export(&self, note: &Note) -> Result<Export> {
         let directory = self.note_directory(note);
         fs::create_dir_all(&directory)
             .with_context(|| format!("failed to create {}", directory.display()))?;
         let path = resolve_path(
             &directory,
             &format!("{}.md", sanitize_file_name(&note.title)),
-            self.overwrite,
+            self.mode.overwrites(),
         );
         let stem = path
             .file_stem()
@@ -268,7 +355,8 @@ impl Exporter {
             assets_dir: directory.join("assets").join(&stem),
             assets_prefix: Path::new("assets").join(&stem),
             copied: HashMap::new(),
-            overwrite: self.overwrite,
+            written: Vec::new(),
+            overwrite: self.mode.overwrites(),
         };
         let body = rewriter.rewrite(&note.text);
 
@@ -279,7 +367,11 @@ impl Exporter {
         }
         fs::write(&path, contents)
             .with_context(|| format!("failed to write {}", path.display()))?;
-        Ok(rewriter.copied.len())
+
+        let attachments = rewriter.copied.len();
+        let mut files = rewriter.written;
+        files.push(path);
+        Ok(Export { attachments, files })
     }
 
     /// Notes live in a directory tree derived from their first tag; untagged
@@ -311,6 +403,9 @@ struct AttachmentRewriter<'a> {
     assets_prefix: PathBuf,
     /// Source path → rewritten link, so a file referenced twice is copied once.
     copied: HashMap<PathBuf, String>,
+    /// Destination paths of the attachments copied, in the order they were
+    /// written, so `Mode::Mirror` knows which files to keep.
+    written: Vec<PathBuf>,
     /// Overwrite existing attachments instead of writing suffixed copies.
     overwrite: bool,
 }
@@ -390,6 +485,7 @@ impl AttachmentRewriter<'_> {
         }
         let link = encode_link(&self.assets_prefix.join(destination.file_name()?));
         self.copied.insert(source, link.clone());
+        self.written.push(destination);
         Some((link, name))
     }
 }
