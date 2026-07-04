@@ -49,7 +49,7 @@ tools:
 | ---- | ------- |
 | `copy` (default) | Never overwrite; write the note or attachment to a copy with a numerical suffix (` (2)`, ` (3)`, …) instead. Files already in the output directory are never touched. |
 | `update` | Overwrite existing files in place, but leave any other files in the output directory alone. |
-| `mirror` | Overwrite existing files in place **and** delete notes and attachments in the output directory that no longer correspond to anything in Bear, so the output becomes an exact replica of the export. |
+| `mirror` | Overwrite existing files in place **and** delete notes and attachments in the output directory that no longer correspond to anything in Bear, so the output becomes an exact replica of the export. A `.git` directory in the output is always left untouched, so the export can be kept under version control. |
 
 Encrypted notes are skipped (Bear does not store their text in readable
 form); a warning is printed for each attachment that is referenced but

@@ -197,6 +197,12 @@ fn prune_dir(dir: &Path, kept: &HashSet<PathBuf>, deleted: &mut usize) -> Result
     for entry in fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))? {
         let entry = entry?;
         let path = entry.path();
+        // Never prune version-control metadata: the output directory is often a
+        // Git repository, and deleting `.git` would destroy its history.
+        if entry.file_name() == ".git" {
+            empty = false;
+            continue;
+        }
         if entry.file_type()?.is_dir() {
             if prune_dir(&path, kept, deleted)? {
                 fs::remove_dir(&path)
@@ -714,4 +720,40 @@ fn encode_link(path: &Path) -> String {
         })
         .collect::<Vec<_>>()
         .join("/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prune_removes_stale_files_but_keeps_git() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path();
+
+        // A note that should survive because it is in `kept`.
+        let kept_note = output.join("keep.md");
+        fs::write(&kept_note, "keep").unwrap();
+        // A stale note that no longer corresponds to anything in Bear.
+        let stale_note = output.join("stale.md");
+        fs::write(&stale_note, "stale").unwrap();
+        // A Git repository backing the output directory.
+        let git = output.join(".git");
+        fs::create_dir_all(git.join("objects")).unwrap();
+        let head = git.join("HEAD");
+        fs::write(&head, "ref: refs/heads/main").unwrap();
+
+        let mut kept = HashSet::new();
+        kept.insert(kept_note.canonicalize().unwrap());
+
+        let deleted = prune(output, &kept).unwrap();
+
+        assert_eq!(deleted, 1);
+        assert!(kept_note.exists());
+        assert!(!stale_note.exists());
+        // The Git metadata must be left completely untouched.
+        assert!(git.is_dir());
+        assert!(head.exists());
+        assert!(git.join("objects").is_dir());
+    }
 }
