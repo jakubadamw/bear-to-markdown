@@ -94,6 +94,23 @@ struct Note {
     tags: Vec<String>,
     created: DateTime<Utc>,
     modified: DateTime<Utc>,
+    /// Attachments Bear records for this note in its database, regardless of
+    /// whether the note text references them.
+    attachments: Vec<Attachment>,
+}
+
+/// A file embedded in a note, as recorded in Bear's `ZSFNOTEFILE` table. The
+/// file lives on disk at `<attachment dir>/<unique_id>/<filename>`.
+struct Attachment {
+    unique_id: String,
+    filename: String,
+}
+
+impl Attachment {
+    /// Path of the file relative to an attachment directory.
+    fn relative_path(&self) -> PathBuf {
+        Path::new(&self.unique_id).join(&self.filename)
+    }
 }
 
 fn main() -> Result<()> {
@@ -238,10 +255,12 @@ fn load_notes(connection: &Connection, cli: &Cli) -> Result<Vec<Note>> {
         conditions.push("ZARCHIVED = 0");
     }
     let query = format!(
-        "SELECT ZTITLE, ZTEXT, ZCREATIONDATE, ZMODIFICATIONDATE, {encrypted} AS encrypted \
+        "SELECT Z_PK, ZTITLE, ZTEXT, ZCREATIONDATE, ZMODIFICATIONDATE, {encrypted} AS encrypted \
          FROM ZSFNOTE WHERE {} ORDER BY ZCREATIONDATE",
         conditions.join(" AND ")
     );
+
+    let mut attachments = load_attachments(connection)?;
 
     let mut statement = connection
         .prepare(&query)
@@ -254,6 +273,7 @@ fn load_notes(connection: &Connection, cli: &Cli) -> Result<Vec<Note>> {
             encrypted_count += 1;
             continue;
         }
+        let pk: i64 = row.get("Z_PK")?;
         let text: String = row.get("ZTEXT")?;
         let title = row
             .get::<_, Option<String>>("ZTITLE")?
@@ -269,6 +289,7 @@ fn load_notes(connection: &Connection, cli: &Cli) -> Result<Vec<Note>> {
                 row.get::<_, Option<f64>>("ZMODIFICATIONDATE")?
                     .unwrap_or_default(),
             ),
+            attachments: attachments.remove(&pk).unwrap_or_default(),
             title,
             text,
         });
@@ -280,6 +301,39 @@ fn load_notes(connection: &Connection, cli: &Cli) -> Result<Vec<Note>> {
         );
     }
     Ok(notes)
+}
+
+/// Loads every note's attachments from Bear's `ZSFNOTEFILE` table, keyed by the
+/// note's primary key. Returns an empty map on schemas that predate the table.
+fn load_attachments(connection: &Connection) -> Result<HashMap<i64, Vec<Attachment>>> {
+    // Older Bear schemas may lack the table (or these columns); degrade to the
+    // text-based rewriting alone rather than failing the whole export.
+    if !has_column(connection, "ZSFNOTEFILE", "ZUNIQUEIDENTIFIER")
+        || !has_column(connection, "ZSFNOTEFILE", "ZFILENAME")
+        || !has_column(connection, "ZSFNOTEFILE", "ZNOTE")
+    {
+        return Ok(HashMap::new());
+    }
+
+    let mut statement = connection.prepare(
+        "SELECT ZNOTE, ZUNIQUEIDENTIFIER, ZFILENAME FROM ZSFNOTEFILE \
+         WHERE ZNOTE IS NOT NULL AND ZUNIQUEIDENTIFIER IS NOT NULL AND ZFILENAME IS NOT NULL",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut attachments: HashMap<i64, Vec<Attachment>> = HashMap::new();
+    while let Some(row) = rows.next()? {
+        let note: i64 = row.get("ZNOTE")?;
+        let unique_id: String = row.get("ZUNIQUEIDENTIFIER")?;
+        let filename: String = row.get("ZFILENAME")?;
+        if filename.trim().is_empty() {
+            continue;
+        }
+        attachments.entry(note).or_default().push(Attachment {
+            unique_id,
+            filename,
+        });
+    }
+    Ok(attachments)
 }
 
 fn has_column(connection: &Connection, table: &str, column: &str) -> bool {
@@ -357,8 +411,14 @@ impl Exporter {
             copied: HashMap::new(),
             written: Vec::new(),
             overwrite: self.mode.overwrites(),
+            by_filename: note
+                .attachments
+                .iter()
+                .map(|attachment| (attachment.filename.clone(), attachment.relative_path()))
+                .collect(),
         };
-        let body = rewriter.rewrite(&note.text);
+        let mut body = rewriter.rewrite(&note.text);
+        append_orphan_attachments(&mut rewriter, note, &mut body);
 
         let mut contents = front_matter(note);
         contents.push_str(&body);
@@ -408,6 +468,10 @@ struct AttachmentRewriter<'a> {
     written: Vec<PathBuf>,
     /// Overwrite existing attachments instead of writing suffixed copies.
     overwrite: bool,
+    /// File name → path relative to the attachment store (`<unique id>/<name>`),
+    /// from Bear's database, used to resolve references that don't already spell
+    /// out the attachment store path.
+    by_filename: HashMap<String, PathBuf>,
 }
 
 impl AttachmentRewriter<'_> {
@@ -417,7 +481,7 @@ impl AttachmentRewriter<'_> {
         static BEAR_TOKEN: LazyLock<Regex> =
             LazyLock::new(|| Regex::new(r"\[(image|file):([^\]\n]+)\]").unwrap());
         let text = BEAR_TOKEN.replace_all(text, |captures: &Captures| {
-            match self.import(&captures[2]) {
+            match self.import(&captures[2], true) {
                 Some((link, name)) if &captures[1] == "image" => format!("![{name}]({link})"),
                 Some((link, name)) => format!("[{name}]({link})"),
                 None => {
@@ -434,7 +498,7 @@ impl AttachmentRewriter<'_> {
             LazyLock::new(|| Regex::new(r"(!?)\[([^\]\n]*)\]\(([^)\n]+)\)").unwrap());
         MARKDOWN_LINK
             .replace_all(&text, |captures: &Captures| {
-                match self.import(&captures[3]) {
+                match self.import(&captures[3], false) {
                     Some((link, name)) => {
                         let label = match &captures[2] {
                             "" if captures[1].is_empty() => name.as_str(),
@@ -452,20 +516,9 @@ impl AttachmentRewriter<'_> {
     /// store, possibly percent-encoded) into the assets directory. Returns the
     /// link to use in Markdown and the attachment's file name, or `None` if
     /// `target` does not point at an attachment.
-    fn import(&mut self, target: &str) -> Option<(String, String)> {
+    fn import(&mut self, target: &str, allow_filename_fallback: bool) -> Option<(String, String)> {
         let decoded = percent_decode_str(target).decode_utf8().ok()?;
-        let relative = Path::new(decoded.as_ref());
-        if relative
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-        {
-            return None;
-        }
-        let source = self
-            .source_dirs
-            .iter()
-            .map(|directory| directory.join(relative))
-            .find(|candidate| candidate.is_file())?;
+        let source = self.resolve_source(Path::new(decoded.as_ref()), allow_filename_fallback)?;
         let name = source.file_name()?.to_string_lossy().into_owned();
         if let Some(link) = self.copied.get(&source) {
             return Some((link.clone(), name));
@@ -488,6 +541,89 @@ impl AttachmentRewriter<'_> {
         self.written.push(destination);
         Some((link, name))
     }
+
+    /// Locates the on-disk file a reference points at. A `relative` path made of
+    /// plain components is looked up directly in the attachment directories.
+    /// When `allow_filename_fallback` is set and that fails (or the path is
+    /// unsafe to join), the reference's file name is matched against the
+    /// attachments Bear records for the note — used only for Bear's unambiguous
+    /// `[image:…]`/`[file:…]` tokens, never for arbitrary Markdown links that
+    /// might point at unrelated external targets.
+    fn resolve_source(&self, relative: &Path, allow_filename_fallback: bool) -> Option<PathBuf> {
+        if relative
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+            && let Some(source) = self.source_for(relative)
+        {
+            return Some(source);
+        }
+        if !allow_filename_fallback {
+            return None;
+        }
+        let name = relative.file_name()?.to_string_lossy();
+        let known = self.by_filename.get(name.as_ref())?;
+        self.source_for(known)
+    }
+
+    /// The first attachment directory that actually contains `relative`.
+    fn source_for(&self, relative: &Path) -> Option<PathBuf> {
+        self.source_dirs
+            .iter()
+            .map(|directory| directory.join(relative))
+            .find(|candidate| candidate.is_file())
+    }
+}
+
+/// Copies any of the note's recorded attachments that the note text did not
+/// already reference, appending a Markdown link for each so nothing Bear
+/// considers embedded is dropped from the export.
+fn append_orphan_attachments(rewriter: &mut AttachmentRewriter<'_>, note: &Note, body: &mut String) {
+    let mut appended = Vec::new();
+    for attachment in &note.attachments {
+        let relative = attachment.relative_path();
+        match rewriter.source_for(&relative) {
+            // Already copied while rewriting the text — it is referenced inline.
+            Some(source) if rewriter.copied.contains_key(&source) => {}
+            Some(_) => {
+                if let Some(link) = rewriter.import(&relative.to_string_lossy(), false) {
+                    appended.push(link);
+                }
+            }
+            None => eprintln!(
+                "warning: attachment {} of note “{}” not found on disk",
+                attachment.filename, note.title
+            ),
+        }
+    }
+    if appended.is_empty() {
+        return;
+    }
+    if !body.ends_with('\n') {
+        body.push('\n');
+    }
+    body.push('\n');
+    for (link, name) in appended {
+        if is_image(&name) {
+            body.push_str(&format!("![{name}]({link})\n"));
+        } else {
+            body.push_str(&format!("[{name}]({link})\n"));
+        }
+    }
+}
+
+/// Whether a file name looks like an image, based on its extension.
+fn is_image(name: &str) -> bool {
+    Path::new(name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "gif" | "heic" | "heif" | "webp" | "tiff" | "tif"
+                    | "bmp" | "svg"
+            )
+        })
+        .unwrap_or(false)
 }
 
 /// YAML front matter understood by Obsidian, Logseq, and similar apps.
