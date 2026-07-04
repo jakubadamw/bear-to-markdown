@@ -14,7 +14,11 @@ as their primary storage format (Obsidian, Logseq, …):
 - Bear's proprietary `[image:…]`/`[file:…]` embeds, as well as Bear 2's
   links into its internal attachment store, are rewritten to standard
   relative Markdown links, and the referenced files are copied into an
-  `assets/<note name>/` directory next to the note.
+  `assets/<note name>/` directory next to the note;
+- attachments Bear records for a note in its database but that aren't
+  referenced in the visible note text are copied into the same `assets/`
+  directory and appended to the note as Markdown image/file links, so
+  nothing embedded gets dropped.
 
 ## Usage
 
