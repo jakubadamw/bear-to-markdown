@@ -57,6 +57,11 @@ struct Cli {
     /// directory per tag.
     #[arg(long)]
     flat: bool,
+
+    /// Overwrite existing files instead of writing a copy with a numerical
+    /// suffix (` (2)`, ` (3)`, …).
+    #[arg(long)]
+    overwrite: bool,
 }
 
 struct Note {
@@ -97,6 +102,7 @@ fn main() -> Result<()> {
             app_data.join("Local Files").join("Note Files"),
         ],
         flat: cli.flat,
+        overwrite: cli.overwrite,
     };
     let mut attachments = 0;
     for note in &notes {
@@ -236,6 +242,7 @@ struct Exporter {
     output: PathBuf,
     attachment_dirs: Vec<PathBuf>,
     flat: bool,
+    overwrite: bool,
 }
 
 impl Exporter {
@@ -245,9 +252,10 @@ impl Exporter {
         let directory = self.note_directory(note);
         fs::create_dir_all(&directory)
             .with_context(|| format!("failed to create {}", directory.display()))?;
-        let path = unique_path(
+        let path = resolve_path(
             &directory,
             &format!("{}.md", sanitize_file_name(&note.title)),
+            self.overwrite,
         );
         let stem = path
             .file_stem()
@@ -260,6 +268,7 @@ impl Exporter {
             assets_dir: directory.join("assets").join(&stem),
             assets_prefix: Path::new("assets").join(&stem),
             copied: HashMap::new(),
+            overwrite: self.overwrite,
         };
         let body = rewriter.rewrite(&note.text);
 
@@ -302,6 +311,8 @@ struct AttachmentRewriter<'a> {
     assets_prefix: PathBuf,
     /// Source path → rewritten link, so a file referenced twice is copied once.
     copied: HashMap<PathBuf, String>,
+    /// Overwrite existing attachments instead of writing suffixed copies.
+    overwrite: bool,
 }
 
 impl AttachmentRewriter<'_> {
@@ -372,7 +383,7 @@ impl AttachmentRewriter<'_> {
             );
             return None;
         }
-        let destination = unique_path(&self.assets_dir, &name);
+        let destination = resolve_path(&self.assets_dir, &name, self.overwrite);
         if let Err(error) = fs::copy(&source, &destination) {
             eprintln!("warning: failed to copy {}: {error}", source.display());
             return None;
@@ -439,8 +450,12 @@ fn sanitize_file_name(name: &str) -> String {
 }
 
 /// `directory/file_name`, with ` (2)`, ` (3)`, … appended to the stem if the
-/// name is already taken.
-fn unique_path(directory: &Path, file_name: &str) -> PathBuf {
+/// name is already taken — unless `overwrite` is set, in which case the plain
+/// `directory/file_name` is returned even when it already exists.
+fn resolve_path(directory: &Path, file_name: &str, overwrite: bool) -> PathBuf {
+    if overwrite {
+        return directory.join(file_name);
+    }
     let stem = Path::new(file_name)
         .file_stem()
         .unwrap_or_default()
