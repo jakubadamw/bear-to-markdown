@@ -36,7 +36,16 @@ Options:
 | `--include-trashed` | Also export notes that are in the trash. |
 | `--include-archived` | Also export archived notes. |
 | `--flat` | Put all notes directly into the output directory instead of one directory per tag. |
-| `--overwrite` | Overwrite existing files instead of writing a copy with a numerical suffix (` (2)`, ` (3)`, …). |
+| `--mode <MODE>` | How to treat a note or attachment whose file name already exists in the output directory (default: `copy`). |
+
+`--mode` takes one of three values, named after the idioms of rsync-like
+tools:
+
+| Mode | Meaning |
+| ---- | ------- |
+| `copy` (default) | Never overwrite; write the note or attachment to a copy with a numerical suffix (` (2)`, ` (3)`, …) instead. Files already in the output directory are never touched. |
+| `update` | Overwrite existing files in place, but leave any other files in the output directory alone. |
+| `mirror` | Overwrite existing files in place **and** delete notes and attachments in the output directory that no longer correspond to anything in Bear, so the output becomes an exact replica of the export. |
 
 Encrypted notes are skipped (Bear does not store their text in readable
 form); a warning is printed for each attachment that is referenced but
